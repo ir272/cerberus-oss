@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-import sys, os, json, re, shlex
+# Drive-guard PreToolUse hook.
+# (a) Hard dependency on Python 3 (shebang is python3; uses py3-only stdlib behavior).
+# (b) Fail-closed posture: a parseable event whose per-tool protected decision raises
+#     an internal error is DENIED (fail closed) rather than silently allowed. An
+#     unparseable stdin event cannot identify a target, so it is allowed (with a STDERR
+#     warning) to avoid bricking every legitimate tool call.
+import sys, os, json, re, shlex, glob as _glob, fnmatch
 
 IS_WIN = os.name == "nt"
 RE_FLAGS = re.IGNORECASE
@@ -232,12 +238,163 @@ def bash_path_tokens(command):
                 yield from bash_path_tokens(" ".join(toks[j + 1:]))
                 break
 
+_GLOB_META = ("*", "?", "[")
+
+def _has_glob_meta(t):
+    return any(ch in t for ch in _GLOB_META)
+
+def _glob_expand_hits(tok, cwd, raws):
+    """A token may contain shell wildcards; the shell expands them at runtime before
+    the tool ever sees a literal path. Mirror that: expand the token with glob.glob()
+    (non-recursive, after expanduser/expandvars, relative tokens resolved against the
+    event cwd) and report the first expansion that canon()s into a protected path.
+    Because glob only yields paths that actually exist on disk, this fires only when a
+    wildcard genuinely resolves into the protected tree (near-zero false positives)."""
+    p = os.path.expandvars(os.path.expanduser(tok))
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    try:
+        results = _glob.glob(p)
+    except Exception:
+        return None
+    for r in results:
+        if matches(canon(r, cwd), raws):
+            return r
+    return None
+
+def _protected_canon_forms(cwd, raws):
+    """Representative resolved protected path strings for fnmatch-style comparison.
+    A protected pattern may retain a glob segment (e.g. GoogleDrive-*/Shared drives)
+    because prep_pattern() only realpath()s the static prefix; that is fine for the
+    -path/-ipath substring tests, which themselves operate on glob patterns."""
+    forms = []
+    for r in raws:
+        c = canon(prep_pattern(r), cwd)
+        if c and c not in forms:
+            forms.append(c)
+    return forms
+
+def _protected_concrete_dirs(cwd, raws):
+    """glob.glob()-expanded concrete protected directories that exist on disk. Used as
+    the *name* side of find -path tests so the only wildcards in play come from find's
+    own pattern (the protected pattern's own glob segment is resolved away)."""
+    out = []
+    for r in raws:
+        pp = os.path.expandvars(os.path.expanduser(r))
+        if not os.path.isabs(pp):
+            pp = os.path.join(cwd or os.getcwd(), pp)
+        try:
+            for g in _glob.glob(pp):
+                c = canon(g, cwd)
+                if c and c not in out:
+                    out.append(c)
+        except Exception:
+            pass
+    return out
+
+def _root_is_protected_ancestor(rc, raws):
+    """True if the concrete directory rc is at/above a protected path, honoring glob
+    segments in the protected pattern (so rc=.../GoogleDrive-test@x.com counts as an
+    ancestor of .../GoogleDrive-*/Shared drives). Compares segment-by-segment, matching
+    a protected glob segment against the concrete rc segment via fnmatch."""
+    rc_segs = [s for s in rc.split("/") if s]
+    for r in raws:
+        prot = canon(prep_pattern(r), None) if rc.startswith("/") else prep_pattern(r)
+        prot = prot or prep_pattern(r)
+        p_segs = [s for s in prot.split("/") if s]
+        if len(rc_segs) > len(p_segs):
+            continue
+        ok = True
+        for rs, ps in zip(rc_segs, p_segs):
+            a, b = (rs.lower(), ps.lower()) if RE_FLAGS else (rs, ps)
+            if not fnmatch.fnmatch(a, b):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+def _find_reason(toks, cwd, raws):
+    """Targeted handling for find(1): its -path/-ipath/-wholename patterns are evaluated
+    by find itself (not the shell), and a search root at/above a protected ancestor
+    combined with any filter can surface protected children via -exec. Neither is caught
+    by literal token matching, so inspect find's own argv here."""
+    if not toks or os.path.basename(toks[0]) != "find":
+        return None
+    # Concrete (existing) protected dirs for the -path tests; fall back to the canon
+    # forms (which may keep a glob segment) only when nothing is on disk yet.
+    concrete = _protected_concrete_dirs(cwd, raws)
+    prots = concrete or _protected_canon_forms(cwd, raws)
+    if not prots:
+        return None
+    PATH_PREDS = ("-path", "-ipath", "-wholename", "-iwholename")
+    FILTER_PREDS = PATH_PREDS + ("-name", "-iname", "-regex", "-iregex")
+    roots, has_filter = [], False
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t in PATH_PREDS and i + 1 < len(toks):
+            has_filter = True
+            pat = toks[i + 1]
+            ci = t in ("-ipath", "-iwholename")
+            fp = pat.lower() if ci else pat
+            # Literal (wildcard-stripped) content of the find pattern. Requiring the
+            # protected dir's basename to appear here keeps us from firing on an
+            # incidental substring match (e.g. '*x*' happening to hit a char in the
+            # resolved path) — the pattern must actually name the protected tree.
+            fp_literal = fp.replace("*", "").replace("?", "")
+            for prot in prots:
+                p = prot.lower() if ci else prot
+                base = os.path.basename(p.rstrip("/"))
+                names_prot = base in fp_literal
+                cand = [p, p + "/", p + "/__dg_child__", p + "/a/b"]
+                hit = fp == p or fp.startswith(p + "/") or any(fnmatch.fnmatch(c, fp) for c in cand)
+                if hit and (names_prot or fp_literal.startswith(p) or p in fp_literal):
+                    return f"find -path/-ipath pattern targets a protected Shared-drive path: {pat}"
+            i += 2
+            continue
+        if t in FILTER_PREDS:
+            has_filter = True
+            i += 2
+            continue
+        if t.startswith("-") or t in ("(", ")", "!", ";", "+", "{}"):
+            i += 1
+            continue
+        if looks_like_path(t) or not t.startswith("-"):
+            roots.append(t)
+        i += 1
+    if has_filter:
+        for root in roots:
+            rc = canon(root, cwd)
+            if not rc:
+                continue
+            # search root is at/inside a protected path -> matches() covers it.
+            if matches(rc, raws):
+                return f"find searches inside a protected Shared-drive path: {root}"
+            # search root is an ancestor of a protected path -> a filter can surface
+            # protected children via -exec; conservatively deny.
+            if _root_is_protected_ancestor(rc, raws):
+                return f"find search root is above a protected Shared-drive path: {root}"
+    return None
+
 def bash_block_reason(command, cwd, raws):
     if matches(canon(cwd, cwd), raws):
         return f"command runs inside a protected Shared-drive path (cwd: {cwd})"
     for tok in bash_path_tokens(command):
         if matches(canon(tok, cwd), raws):
             return f"command references a protected Shared-drive path: {tok}"
+        if _has_glob_meta(tok):
+            hit = _glob_expand_hits(tok, cwd, raws)
+            if hit:
+                return f"command wildcard expands into a protected Shared-drive path: {hit}"
+    for seg in _segments(command):
+        seg = seg.strip()
+        if not seg:
+            continue
+        toks = _split(seg)
+        fr = _find_reason(toks, cwd, raws)
+        if fr:
+            return fr
     if command_mentions(command, raws):
         return "command text references a protected Shared-drive path"
     return None
@@ -333,7 +490,11 @@ def deny_now(tool, target, reason):
 def main():
     try:
         data = json.loads(sys.stdin.read().lstrip("\ufeff"))
-    except Exception:
+    except Exception as e:
+        # Unparseable stdin cannot identify a protected target; allow rather than brick
+        # every tool call, but warn on STDERR so the failure is not silent.
+        print(f"drive-guard: WARNING \u2014 could not parse hook stdin as JSON ({e}); allowing.",
+              file=sys.stderr)
         sys.exit(0)
     tool = data.get("tool_name", "")
     ti = data.get("tool_input", {}) or {}
@@ -346,16 +507,40 @@ def main():
     if any(tool.startswith(p) for p in MCP_BLOCKED_PREFIXES):
         deny_now(tool, tool, f"Google Drive MCP connector blocked: {tool} is not permitted.")
 
+    # The target actually evaluated for Glob/Grep is their pattern/glob, not path_field
+    # (which is None for those tools). Surface it to deny_now()/audit() instead of None.
+    eval_target = path_field or ti.get("pattern") or ti.get("glob")
+
     if m == "block":
         if tool in PATH_TOOLS:
-            target = canon(path_field, cwd) if path_field else canon(cwd, cwd)
-            if matches(target, raws):
-                deny_now(tool, target, f"Locked Google Drive (Shared drives): {tool} on "
-                         f"'{target}' is blocked — no operations permitted on this path.")
-            audit("allow", tool, target, "")
+            try:
+                target = canon(path_field, cwd) if path_field else canon(cwd, cwd)
+                hit = matches(target, raws)
+                # Glob carries its location in "pattern"; Grep in "glob". These may
+                # contain wildcards (**), so resolve their static prefix the same way
+                # prep_pattern() does, then test against matches().
+                pat_target = None
+                if not hit and tool == "Glob" and ti.get("pattern"):
+                    pat_target = canon(prep_pattern(ti.get("pattern")), cwd)
+                    hit = matches(pat_target, raws)
+                if not hit and tool == "Grep" and ti.get("glob"):
+                    pat_target = canon(prep_pattern(ti.get("glob")), cwd)
+                    hit = matches(pat_target, raws)
+            except Exception as e:
+                deny_now(tool, eval_target, f"Locked Google Drive (Shared drives): "
+                         f"{tool} denied (fail closed on internal error: {e}).")
+            if hit:
+                shown = pat_target or target
+                deny_now(tool, shown, f"Locked Google Drive (Shared drives): {tool} on "
+                         f"'{shown}' is blocked — no operations permitted on this path.")
+            audit("allow", tool, eval_target or target, "")
             sys.exit(0)
         if tool == "Bash":
-            reason = bash_block_reason(ti.get("command", "") or "", cwd, raws)
+            try:
+                reason = bash_block_reason(ti.get("command", "") or "", cwd, raws)
+            except Exception as e:
+                deny_now(tool, ti.get("command", ""), f"Locked Google Drive (Shared drives): "
+                         f"Bash denied (fail closed on internal error: {e}).")
             if reason:
                 deny_now(tool, ti.get("command", ""), f"Locked Google Drive (Shared drives): "
                          f"{reason}. Blocked.")
@@ -364,17 +549,26 @@ def main():
         sys.exit(0)
 
     if tool in WRITE_TOOLS:
-        target = canon(path_field, cwd)
-        if matches(target, raws):
+        try:
+            target = canon(path_field, cwd)
+            hit = matches(target, raws)
+        except Exception as e:
+            deny_now(tool, path_field, f"Read-only Google Drive: {tool} denied "
+                     f"(fail closed on internal error: {e}).")
+        if hit:
             deny_now(tool, target, f"Read-only Google Drive: '{target}' is inside a protected "
                      f"path; {tool} blocked.")
         audit("allow", tool, target, "")
         sys.exit(0)
     if tool == "Bash":
-        reason = bash_write_reason(ti.get("command", "") or "", cwd, raws)
+        try:
+            reason = bash_write_reason(ti.get("command", "") or "", cwd, raws)
+        except Exception as e:
+            deny_now(tool, ti.get("command", ""), f"Read-only Google Drive: Bash denied "
+                     f"(fail closed on internal error: {e}).")
         if reason:
             deny_now(tool, ti.get("command", ""), f"Read-only Google Drive: {reason}. "
-                     f"Blocked (OS sandbox also enforces writes).")
+                     f"Blocked.")
         audit("allow", tool, ti.get("command", ""), "")
         sys.exit(0)
     sys.exit(0)
