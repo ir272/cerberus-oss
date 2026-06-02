@@ -29,29 +29,78 @@ denies the call rather than guessing. (The one exception is an unparseable hook 
 can't identify any target — that is allowed with a warning on stderr so a malformed event
 can't brick every tool call.)
 
-## Install (single user)
+## Requirement
 
-```
-/plugin marketplace add ir272/cerberus-oss
-/plugin install drive-guard@cerberus
-```
+`drive-guard.py` is single-file, **standard-library-only Python 3 — no `pip install`.** Every
+seat needs `python3` (or `python`) on its `PATH`; the launcher (`run-guard.sh`) picks whichever
+exists at runtime. If neither is present the hook can't run (see [Limits](#limits)).
 
-`drive-guard.py` is single-file, standard-library-only Python 3 — no `pip install`. You need
-`python3` (or `python`) on `PATH`; the launcher (`run-guard.sh`) probes for one at runtime.
+## Deploy — Option 1: single user
 
-## Enforce org-wide
+Try it on one machine:
 
-Installing the plugin is the *packaging*; making it **non-optional** comes from Claude Code
-**managed settings**, which you push through the Claude.ai admin console or your MDM. Two keys
-do the work:
+1. In Claude Code, add this repo as a marketplace and install the plugin:
 
-- **`extraKnownMarketplaces`** — registers `ir272/cerberus-oss` as a trusted marketplace so
-  every seat can resolve the plugin without each user adding it by hand.
-- **`enabledPlugins`** — force-enables `drive-guard@cerberus` so users cannot turn it off.
+   ```
+   /plugin marketplace add ir272/cerberus-oss
+   /plugin install drive-guard@cerberus
+   ```
 
-Managed settings outrank user and project settings, so once these are pushed the hook runs on
-every seat and can't be disabled locally. (The managed-settings file is environment-specific
-and is not shipped in this repo — author it for your org.)
+   If Claude Code prompts you to approve the plugin's hook, accept it.
+2. Confirm it loaded: `/plugin` should list **drive-guard** as installed/enabled.
+3. Verify enforcement — see [Verify it works](#verify-it-works).
+
+To update later: `/plugin marketplace update cerberus`.
+
+## Deploy — Option 2: whole organization (enforced)
+
+Per-user install is just packaging; making the guard **non-optional for everyone** comes from
+Claude Code **managed settings**, pushed from the **Claude.ai admin console** (Team/Enterprise)
+or your MDM. This repo ships the exact policy: **[`managed-settings.plugin.json`](managed-settings.plugin.json)**.
+
+What that policy does:
+
+- **`extraKnownMarketplaces`** registers this repo (`ir272/cerberus-oss`) as a trusted
+  marketplace named `cerberus`, so every seat can resolve the plugin without anyone running
+  `/plugin marketplace add`.
+- **`enabledPlugins`** force-enables `drive-guard@cerberus` — the hook runs on every seat and
+  users can't disable it (force-enabled plugin hooks need no per-user approval).
+- **`permissions.disableBypassPermissionsMode: "disable"`** blocks the mode that would let a
+  user skip permission prompts.
+
+Steps:
+
+1. Open the **Claude.ai admin console** for your organization and create/edit a **Claude Code
+   managed settings** policy (Enterprise/Team server-managed settings).
+2. Paste the contents of [`managed-settings.plugin.json`](managed-settings.plugin.json) and
+   **publish** it to the whole org (or a specific user group).
+   - *MDM / image alternative:* place the same JSON at the OS managed-settings path instead —
+     macOS: `/Library/Application Support/ClaudeCode/managed-settings.json`,
+     Windows: `C:\ProgramData\ClaudeCode\managed-settings.json`.
+3. On each seat, the next Claude Code launch registers the marketplace, force-installs
+   `drive-guard`, and starts enforcing. Managed settings outrank user/project settings, so it
+   can't be turned off locally. Verify with [Verify it works](#verify-it-works).
+
+> **Names look mismatched on purpose.** The marketplace is named `cerberus` (declared in
+> `marketplace.json`) while the repo is `cerberus-oss`. That's why the policy reads
+> `drive-guard@cerberus` with source repo `ir272/cerberus-oss`.
+
+> **Harden for real records (recommended).** The hook is best-effort and **fails open if no
+> Python is on `PATH`** (see [Limits](#limits)). For fail-closed enforcement that needs no
+> interpreter, add the `permissions.deny` block from [Limits](#limits) to the same policy, and
+> set the Shared drive to **Google-side Viewer-only**.
+
+## Verify it works
+
+In a fresh Claude Code session, after install (Option 1) or deployment (Option 2):
+
+- Ask Claude to **read or edit a file under** `…/Shared drives/…` → it must **refuse**.
+- Ask Claude to use the **Google Drive connector** (e.g. search Drive) → it must **refuse**.
+- Ask Claude to read a **My Drive** file, your **local code**, or fetch a **web** page → all
+  work normally.
+
+If a Shared-drive request gets through: confirm `python3`/`python` is on `PATH`, and that
+`/plugin` shows `drive-guard` enabled (Option 1) or that the managed policy published (Option 2).
 
 ## Configuration
 
@@ -144,6 +193,7 @@ macOS OS-level sandbox as a backstop — that is out of scope here.)
 .
 ├── README.md                         # this file
 ├── LICENSE                           # repo license
+├── managed-settings.plugin.json      # org policy: force-install the plugin (Option 2)
 ├── .claude-plugin/marketplace.json   # marketplace "cerberus" -> drive-guard
 └── plugins/drive-guard/
     ├── .claude-plugin/plugin.json    # plugin manifest
