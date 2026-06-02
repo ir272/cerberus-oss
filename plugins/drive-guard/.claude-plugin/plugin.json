@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "drive-guard",
+  "displayName": "Cerberus Drive Guard",
+  "version": "1.0.0",
+  "description": "Blocks Claude Code from reading, changing, or deleting Google Shared drives (filesystem + Google Drive MCP connector). Everything else — My Drive, local code, the web — keeps working.",
+  "author": {
+    "name": "PressW"
+  },
+  "homepage": "https://github.com/ir272/cerberus",
+  "repository": "https://github.com/ir272/cerberus",
+  "license": "UNLICENSED",
+  "keywords": ["security", "google-drive", "guard", "hook", "dlp"],
+  "hooks": "./hooks/hooks.json"
+}
