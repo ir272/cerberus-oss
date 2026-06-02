@@ -15,6 +15,13 @@
 # Windows seats must provide a POSIX sh (Git Bash / WSL) OR the hook must be switched to
 # a "shell":"powershell" variant. See open_concerns.
 
+# PATH-hijack hardening (ISSUE #1): hook commands inherit the caller's PATH, so a
+# user-writable dir earlier on PATH could shadow "python3"/"python" with a fake interpreter
+# that exits 0 and silently disables the guard. Prepend trusted system dirs so the real
+# system interpreter is found first; the inherited PATH stays appended, so a python only in
+# a non-standard dir is still located (preserving the fallback behavior).
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"; export PATH
+
 if command -v python3 >/dev/null 2>&1; then
   exec python3 "$@"
 elif command -v python >/dev/null 2>&1; then
